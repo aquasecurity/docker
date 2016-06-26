@@ -275,9 +275,12 @@ backends use operating system level technologies and can be
 configured.
 
 Specify options to the storage backend with **--storage-opt** flags. The
-backends that currently take options are *devicemapper*, *zfs* and *btrfs*.
+backends that currently take options are *devicemapper*, *zfs*, *btrfs* and *overlay2*.
 Options for *devicemapper* are prefixed with *dm*, options for *zfs*
 start with *zfs* and options for *btrfs* start with *btrfs*.
+Options for *overlay2* over an *xfs* backing fs start with *xfs*.
+These options will be referred to in this manual as *XFS options*, because
+they could be applicable to other storage drivers that use *xfs* as backing fs.
 
 Specifically for devicemapper, the default is a "loopback" model which
 requires no pre-configuration, but is extremely inefficient.  Do not
@@ -549,6 +552,20 @@ a container with **--storage-opt size** option, docker should ensure the
 **size** cannot be smaller than **btrfs.min_space**.
 
 Example use: `docker daemon -s btrfs --storage-opt btrfs.min_space=10G`
+
+## XFS options
+
+#### xfs.first_projid
+
+Specifies the start of range for project ids to be used by dockerd when
+assigning xfs project ids for containers. If user uses disk quota for overlay2
+when creating or running a container with **--storage-opt size** option,
+docker should ensure that overlay2 is over xfs backing fs and that project
+quotas were enabled by setting the `xfs.first_projid` option.
+Also, the backing fs should be mounted with the `pquota` mount option for xfs
+to support project quotas.
+
+Example use: `docker daemon -s overlay2 --storage-opt xfs.first_projid=1000`
 
 # CLUSTER STORE OPTIONS
 
