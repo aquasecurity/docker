@@ -2,6 +2,26 @@
 
 package overlay2
 
+/*
+#include <stdlib.h>
+#include <dirent.h>
+#include <linux/fs.h>
+
+struct fsxattr {
+	__u32		fsx_xflags;
+	__u32		fsx_extsize;
+	__u32		fsx_nextents;
+	__u32		fsx_projid;
+	unsigned char	fsx_pad[12];
+};
+
+#define FS_XFLAG_PROJINHERIT	0x00000200
+#define FS_IOC_FSGETXATTR		_IOR ('X', 31, struct fsxattr)
+#define FS_IOC_FSSETXATTR		_IOW ('X', 32, struct fsxattr)
+
+*/
+import "C"
+
 import (
 	"bufio"
 	"errors"
@@ -10,8 +30,10 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"strconv"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"github.com/Sirupsen/logrus"
 
@@ -219,8 +241,9 @@ func (d *Driver) CreateReadWrite(id, parent, mountLabel string, storageOpt map[s
 // The parent filesystem is used to configure these directories for the overlay.
 func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]string) (retErr error) {
 
-	if len(storageOpt) != 0 {
-		return fmt.Errorf("--storage-opt is not supported for overlay")
+	projid, err := parseStorageOpt(storageOpt)
+	if err != nil {
+		return err
 	}
 
 	dir := d.dir(id)
@@ -242,6 +265,13 @@ func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]str
 			os.RemoveAll(dir)
 		}
 	}()
+
+	if projid != 0 {
+		// set XFS project id to enforce container quota
+		if err := setProjectID(dir, projid); err != nil {
+			return err
+		}
+	}
 
 	if err := idtools.MkdirAs(path.Join(dir, "diff"), 0755, rootUID, rootGID); err != nil {
 		return err
@@ -277,6 +307,81 @@ func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]str
 		if err := ioutil.WriteFile(path.Join(dir, lowerFile), []byte(lower), 0666); err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// parse storage quota options for driver using directories over xfs
+// (and later on ext4)
+func parseStorageOpt(storageOpt map[string]string) (uint32, error) {
+	// Read xfs project id to set the disk quota per container
+	for k, v := range storageOpt {
+		key := strings.ToLower(k)
+		switch key {
+		case "xfs.projid":
+			if backingFs != "xfs" {
+				return 0, fmt.Errorf("Option %s supported only over xfs", key)
+			}
+			projid, err := strconv.ParseUint(v, 10, 32)
+			if err != nil {
+				return 0, err
+			}
+
+			return uint32(projid), nil
+		default:
+			return 0, fmt.Errorf("Unknown option %s", key)
+		}
+	}
+	return 0, nil
+}
+
+func free(p *C.char) {
+	C.free(unsafe.Pointer(p))
+}
+
+func openDir(path string) (*C.DIR, error) {
+	Cpath := C.CString(path)
+	defer free(Cpath)
+
+	dir := C.opendir(Cpath)
+	if dir == nil {
+		return nil, fmt.Errorf("Can't open dir")
+	}
+	return dir, nil
+}
+
+func closeDir(dir *C.DIR) {
+	if dir != nil {
+		C.closedir(dir)
+	}
+}
+
+func getDirFd(dir *C.DIR) uintptr {
+	return uintptr(C.dirfd(dir))
+}
+
+// set project id on container directory to be able to apply container
+// quota when backing storage is xfs and later ext4
+func setProjectID(path string, projid uint32) error {
+	dir, err := openDir(path)
+	if err != nil {
+		return err
+	}
+	defer closeDir(dir)
+
+	var fsx C.struct_fsxattr
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.FS_IOC_FSGETXATTR,
+		uintptr(unsafe.Pointer(&fsx)))
+	if errno != 0 {
+		return fmt.Errorf("Failed to get projid for %s: %v", dir, errno.Error())
+	}
+	fsx.fsx_projid = C.__u32(projid)
+	fsx.fsx_xflags |= C.FS_XFLAG_PROJINHERIT
+	_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.FS_IOC_FSSETXATTR,
+		uintptr(unsafe.Pointer(&fsx)))
+	if errno != 0 {
+		return fmt.Errorf("Failed to set projid for %s: %v", dir, errno.Error())
 	}
 
 	return nil
