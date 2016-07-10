@@ -43,7 +43,9 @@ import (
 	"github.com/docker/docker/pkg/directory"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/mount"
+	"github.com/docker/docker/pkg/parsers"
 	"github.com/docker/docker/pkg/parsers/kernel"
+	"github.com/docker/go-units"
 
 	"github.com/opencontainers/runc/libcontainer/label"
 )
@@ -96,15 +98,27 @@ const (
 	idLength = 26
 )
 
+type xfsOptions struct {
+	projID uint32
+	size   uint64
+}
+
+
 // Driver contains information about the home directory and the list of active mounts that are created using this driver.
 type Driver struct {
 	home    string
 	uidMaps []idtools.IDMap
 	gidMaps []idtools.IDMap
 	ctr     *graphdriver.RefCounter
+	options xfsOptions
 }
 
-var backingFs = "<unknown>"
+var (
+	backingFs = "<unknown>"
+	useProjectQuota = false
+	nextProjID = uint32(0)
+)
+
 
 func init() {
 	graphdriver.Register(driverName, Init)
@@ -156,14 +170,51 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		return nil, err
 	}
 
+	xfsOpt, err := parseXfsOptions(options)
+	if err != nil {
+		return nil, err
+	}
+
+	logrus.Debugf("useProjectQuota=%v, xfs.first_projid=%d", useProjectQuota, xfsOpt.projID)
+
 	d := &Driver{
 		home:    home,
 		uidMaps: uidMaps,
 		gidMaps: gidMaps,
 		ctr:     graphdriver.NewRefCounter(graphdriver.NewFsChecker(graphdriver.FsMagicOverlay)),
+		options: xfsOpt,
 	}
 
 	return d, nil
+}
+
+func parseXfsOptions(opt []string) (xfsOptions, error) {
+	var options xfsOptions
+	for _, option := range opt {
+		key, val, err := parsers.ParseKeyValueOpt(option)
+		if err != nil {
+			return options, err
+		}
+		key = strings.ToLower(key)
+		switch key {
+		case "xfs.first_projid":
+			if backingFs != "xfs" {
+				return options, fmt.Errorf("Option %s supported only over xfs", key)
+			}
+			projid, err := strconv.ParseUint(val, 10, 32)
+			if err != nil {
+				return options, err
+			}
+
+			useProjectQuota = true
+			options.projID = uint32(projid)
+			// TODO: read next projid from persistent storage
+			nextProjID = options.projID
+		default:
+			return options, fmt.Errorf("Unknown option %s", key)
+		}
+	}
+	return options, nil
 }
 
 func supportsOverlay() error {
@@ -240,10 +291,15 @@ func (d *Driver) CreateReadWrite(id, parent, mountLabel string, storageOpt map[s
 // Create is used to create the upper, lower, and merge directories required for overlay fs for a given id.
 // The parent filesystem is used to configure these directories for the overlay.
 func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]string) (retErr error) {
+	var options xfsOptions
+	if useProjectQuota {
+		var err error
+		options, err = parseStorageOpt(storageOpt)
+		if err != nil {
+			return err
+		}
 
-	projid, err := parseStorageOpt(storageOpt)
-	if err != nil {
-		return err
+		logrus.Debugf("xfs.projid=%d, size=%d", options.projID, options.size)
 	}
 
 	dir := d.dir(id)
@@ -266,10 +322,13 @@ func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]str
 		}
 	}()
 
-	if projid != 0 {
+	if useProjectQuota && options.projID != 0 {
 		// set XFS project id to enforce container quota
-		if err := setProjectID(dir, projid); err != nil {
+		if err := setProjectQuota(dir, options); err != nil {
 			return err
+		}
+		if options.projID == nextProjID {
+			nextProjID++
 		}
 	}
 
@@ -314,26 +373,37 @@ func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]str
 
 // parse storage quota options for driver using directories over xfs
 // (and later on ext4)
-func parseStorageOpt(storageOpt map[string]string) (uint32, error) {
-	// Read xfs project id to set the disk quota per container
+func parseStorageOpt(storageOpt map[string]string) (xfsOptions, error) {
+	var options xfsOptions
+	// Read xfs project id/size to set the disk quota per container
+	// if projid is not specified use the nextProjID value
+	// TODO: allocate unused projid's from removed containers
+	options.projID = nextProjID
 	for k, v := range storageOpt {
 		key := strings.ToLower(k)
 		switch key {
+		case "size":
+			size, err := units.RAMInBytes(v)
+			if err != nil {
+				return options, err
+			}
+			options.size = uint64(size)
 		case "xfs.projid":
+			// user specified projid explicitly
 			if backingFs != "xfs" {
-				return 0, fmt.Errorf("Option %s supported only over xfs", key)
+				return options, fmt.Errorf("Option %s supported only over xfs", key)
 			}
 			projid, err := strconv.ParseUint(v, 10, 32)
 			if err != nil {
-				return 0, err
+				return options, err
 			}
 
-			return uint32(projid), nil
+			options.projID = uint32(projid)
 		default:
-			return 0, fmt.Errorf("Unknown option %s", key)
+			return options, fmt.Errorf("Unknown option %s", key)
 		}
 	}
-	return 0, nil
+	return options, nil
 }
 
 func free(p *C.char) {
@@ -361,9 +431,10 @@ func getDirFd(dir *C.DIR) uintptr {
 	return uintptr(C.dirfd(dir))
 }
 
-// set project id on container directory to be able to apply container
-// quota when backing storage is xfs and later ext4
-func setProjectID(path string, projid uint32) error {
+// set project quota on container directory to be able to apply container
+// storage size limit when backing storage is xfs (and later on ext4)
+func setProjectQuota(path string, options xfsOptions) error {
+
 	dir, err := openDir(path)
 	if err != nil {
 		return err
@@ -376,7 +447,7 @@ func setProjectID(path string, projid uint32) error {
 	if errno != 0 {
 		return fmt.Errorf("Failed to get projid for %s: %v", dir, errno.Error())
 	}
-	fsx.fsx_projid = C.__u32(projid)
+	fsx.fsx_projid = C.__u32(options.projID)
 	fsx.fsx_xflags |= C.FS_XFLAG_PROJINHERIT
 	_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, getDirFd(dir), C.FS_IOC_FSSETXATTR,
 		uintptr(unsafe.Pointer(&fsx)))
@@ -386,6 +457,7 @@ func setProjectID(path string, projid uint32) error {
 
 	return nil
 }
+
 
 func (d *Driver) getLower(parent string) (string, error) {
 	parentDir := d.dir(parent)
