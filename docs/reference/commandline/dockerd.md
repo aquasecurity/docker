@@ -255,8 +255,13 @@ to use it.
 ### Storage driver options
 
 Particular storage-driver can be configured with options specified with
-`--storage-opt` flags. Options for `devicemapper` are prefixed with `dm`,
-options for `zfs` start with `zfs` and options for `btrfs` start with `btrfs`.
+`--storage-opt` flags. Backends that currently take options are
+`devicemapper`, `zfs`, `btrfs` and `overlay2`.
+Options for `devicemapper` are prefixed with `dm`, options for `zfs`
+start with `zfs` and options for `btrfs` start with `btrfs`.
+Options for `overlay2` over an `xfs` backing fs start with `xfs`.
+These options are referred to in this guide as `XFS options`, because
+they could be applicable to other storage drivers that use XFS as backing fs.
 
 #### Devicemapper options
 
@@ -565,6 +570,21 @@ options for `zfs` start with `zfs` and options for `btrfs` start with `btrfs`.
 
     Example use:
         $ docker daemon -s btrfs --storage-opt btrfs.min_space=10G
+
+#### XFS options
+
+* `xfs.first_projid`
+
+    Specifies the start of range for project ids to be used by dockerd when
+    assigning xfs project ids for containers. If user uses disk quota for overlay2
+    when creating or running a container with **--storage-opt size** option,
+    docker should ensure that overlay2 is over xfs backing fs and that project
+    quotas were enabled by setting the `xfs.first_projid` option.
+    Also, the backing fs should be mounted with the `pquota` mount option for xfs
+    to support project quotas.
+
+    Example use:
+        $ docker daemon -s overlay2 --storage-opt xfs.first_projid=1000
 
 ## Docker runtime execution options
 

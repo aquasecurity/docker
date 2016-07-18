@@ -154,7 +154,10 @@ Set storage driver options per container.
     $ docker create -it --storage-opt size=120G fedora /bin/bash
 
 This (size) will allow to set the container rootfs size to 120G at creation time. 
-User cannot pass a size less than the Default BaseFS Size. 
+This option is only available for the `devicemapper`, `btrfs`, `zfs` and `overlay2` storage drivers.
+For the `devicemapper`, `btrfs` and `zfs` storage drivers, user cannot pass a size less than the Default BaseFS Size.
+For the `overlay2` storage driver, the size option is only available if the Backing FS is xfs and mounted with the `pquota` mount option.
+Under these conditions, user can pass any size less then the Backing FS size.
 
 ### Specify isolation technology for container (--isolation)
 
