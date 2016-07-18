@@ -121,6 +121,7 @@ type Driver struct {
 
 var (
 	backingFs = "<unknown>"
+	backingFsDev = "<unknown>"
 	useProjectQuota = false
 	nextProjID = uint32(0)
 )
@@ -183,6 +184,13 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 
 	logrus.Debugf("useProjectQuota=%v, xfs.first_projid=%d", useProjectQuota, xfsOpt.projID)
 
+	if useProjectQuota {
+		// Create block device to use for quotactl commands
+		if err := makeBackingFsDev(home); err != nil {
+			return nil, err
+		}
+	}
+
 	d := &Driver{
 		home:    home,
 		uidMaps: uidMaps,
@@ -242,6 +250,25 @@ func supportsOverlay() error {
 	}
 	logrus.Error("'overlay' not found as a supported filesystem on this host. Please ensure kernel is new enough and has overlay support loaded.")
 	return graphdriver.ErrNotSupported
+}
+
+// get the backing block device of the driver home directory
+// and create a block device node under the home directory
+// to be used by quotactl commands
+func makeBackingFsDev(home string) (error) {
+	fileinfo, err := os.Stat(home)
+	if err != nil {
+		return err
+	}
+
+	backingFsDev = path.Join(home, "backingFsDev")
+	syscall.Unlink(backingFsDev)
+	stat := fileinfo.Sys().(*syscall.Stat_t)
+	if err := syscall.Mknod(backingFsDev, syscall.S_IFBLK|0600, int(stat.Dev)); err != nil {
+		return fmt.Errorf("Failed to mknod %s: %v", backingFsDev, err)
+	}
+
+	return nil
 }
 
 func (d *Driver) String() string {
@@ -480,9 +507,7 @@ func setProjectQuota(path string, options xfsOptions) error {
 	d.d_fieldmask = C.FS_DQ_BHARD;
 	d.d_blk_hardlimit = C.__u64(options.size / 512);
 
-	// TODO: get backing fs blockdev
-	dev := "/dev/dm-1"
-	var cs = C.CString(dev)
+	var cs = C.CString(backingFsDev)
 
 	_, _, errno = syscall.Syscall6(syscall.SYS_QUOTACTL, C.Q_XSETPQLIM,
 		uintptr(unsafe.Pointer(cs)), uintptr(fsx.fsx_projid),
@@ -490,7 +515,7 @@ func setProjectQuota(path string, options xfsOptions) error {
 	C.free(unsafe.Pointer(cs))
 	if errno != 0 {
 		return fmt.Errorf("Failed to set quota limit for projid %d on %s: %v",
-				options.projID, dev, errno.Error())
+				options.projID, backingFsDev, errno.Error())
 	}
 
 	return nil
