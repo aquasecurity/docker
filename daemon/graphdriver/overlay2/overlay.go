@@ -6,6 +6,8 @@ package overlay2
 #include <stdlib.h>
 #include <dirent.h>
 #include <linux/fs.h>
+#include <linux/quota.h>
+#include <linux/dqblk_xfs.h>
 
 struct fsxattr {
 	__u32		fsx_xflags;
@@ -18,6 +20,10 @@ struct fsxattr {
 #define FS_XFLAG_PROJINHERIT	0x00000200
 #define FS_IOC_FSGETXATTR		_IOR ('X', 31, struct fsxattr)
 #define FS_IOC_FSSETXATTR		_IOW ('X', 32, struct fsxattr)
+
+#define PRJQUOTA	2
+#define XFS_PROJ_QUOTA	2
+#define Q_XSETPQLIM QCMD(Q_XSETQLIM, PRJQUOTA)
 
 */
 import "C"
@@ -114,6 +120,7 @@ type Driver struct {
 
 var (
 	backingFs       = "<unknown>"
+	backingFsDev    = "<unknown>"
 	useProjectQuota = false
 	nextProjID      = uint32(0)
 )
@@ -182,6 +189,13 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 	}
 
 	logrus.Debugf("useProjectQuota=%v, xfs.first_projid=%d", useProjectQuota, xfsOpt.projID)
+
+	if useProjectQuota {
+		// Create block device to use for quotactl commands
+		if err := makeBackingFsDev(home); err != nil {
+			return nil, err
+		}
+	}
 
 	d := &Driver{
 		home:    home,
@@ -277,6 +291,25 @@ func supportsOverlay() error {
 	return graphdriver.ErrNotSupported
 }
 
+// get the backing block device of the driver home directory
+// and create a block device node under the home directory
+// to be used by quotactl commands
+func makeBackingFsDev(home string) error {
+	fileinfo, err := os.Stat(home)
+	if err != nil {
+		return err
+	}
+
+	backingFsDev = path.Join(home, "backingFsDev")
+	syscall.Unlink(backingFsDev)
+	stat := fileinfo.Sys().(*syscall.Stat_t)
+	if err := syscall.Mknod(backingFsDev, syscall.S_IFBLK|0600, int(stat.Dev)); err != nil {
+		return fmt.Errorf("Failed to mknod %s: %v", backingFsDev, err)
+	}
+
+	return nil
+}
+
 func (d *Driver) String() string {
 	return driverName
 }
@@ -361,14 +394,14 @@ func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]str
 		}
 	}()
 
-	if useProjectQuota {
+	if useProjectQuota && (options.projID != 0 || options.size != 0) {
 		// if projid is not specified use the nextProjID value
 		// TODO: allocate unused projid's from removed containers
 		if options.projID == 0 {
 			options.projID = nextProjID
 		}
 
-		// set XFS project id to enforce container quota
+		// set XFS project id and enforce container disk quota
 		if err := setProjectQuota(dir, options); err != nil {
 			return err
 		}
@@ -474,8 +507,8 @@ func getDirFd(dir *C.DIR) uintptr {
 	return uintptr(C.dirfd(dir))
 }
 
-// set project quota on container directory to be able to apply container
-// storage size limit when backing storage is xfs (and later on ext4)
+// set project quota on container directory and apply container
+// storage quota limit when backing storage is xfs (and later on ext4)
 func setProjectQuota(path string, options xfsOptions) error {
 
 	dir, err := openDir(path)
@@ -499,6 +532,31 @@ func setProjectQuota(path string, options xfsOptions) error {
 		uintptr(unsafe.Pointer(&fsx)))
 	if errno != 0 {
 		return fmt.Errorf("Failed to set projid for %s: %v", path, errno.Error())
+	}
+
+	if options.size == 0 {
+		return nil
+	}
+
+	//
+	// set the quota limit for the container's project id
+	//
+	var d C.fs_disk_quota_t
+	d.d_version = C.FS_DQUOT_VERSION
+	d.d_id = fsx.fsx_projid
+	d.d_flags = C.XFS_PROJ_QUOTA
+	d.d_fieldmask = C.FS_DQ_BHARD
+	d.d_blk_hardlimit = C.__u64(options.size / 512)
+
+	var cs = C.CString(backingFsDev)
+
+	_, _, errno = syscall.Syscall6(syscall.SYS_QUOTACTL, C.Q_XSETPQLIM,
+		uintptr(unsafe.Pointer(cs)), uintptr(fsx.fsx_projid),
+		uintptr(unsafe.Pointer(&d)), 0, 0)
+	C.free(unsafe.Pointer(cs))
+	if errno != 0 {
+		return fmt.Errorf("Failed to set quota limit for projid %d on %s: %v",
+			options.projID, backingFsDev, errno.Error())
 	}
 
 	return nil
